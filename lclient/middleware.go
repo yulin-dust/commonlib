@@ -1,6 +1,9 @@
 package lclient
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // BeforeRequestHook 在请求发出前调用，可修改请求字段。
 // 返回 error 会中止该请求。
@@ -17,8 +20,9 @@ type PreparedRequest struct {
 	Body            []byte
 	Proxy           string
 	Profile         string
-	Timeout         int // seconds
+	Timeout         time.Duration // 整次请求的超时，毫秒精度；<=0 表示不限制
 	FollowRedirects bool
+	MaxRedirects    int             // 跟随重定向的最大跳数；<=0 取默认 10
 	InsecureTLS     bool            // true 时跳过目标 TLS 证书校验（默认 false=校验）
 	MaxBodyBytes    int64           // 响应体大小上限（字节），0 = 不限制
 	BlockPrivateIPs bool            // true 时拦截私网/环回/链路本地地址（SSRF 防护）

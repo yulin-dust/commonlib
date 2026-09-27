@@ -198,6 +198,7 @@ typedef struct {
     size_t body_size;
     char *headers;
     size_t headers_size;
+    char *effective_url; // 跟随完重定向后的最终 URL
     char *error;
 } CurlResponse;
 
@@ -219,10 +220,10 @@ static CurlResponse do_on_handle(CURL *curl, const char *url, const char *proxy,
                               const char *impersonate_target, const char *method,
                               const char **header_keys, const char **header_vals, int header_count,
                               const char *post_data, long post_size,
-                              int follow_redirects, int timeout_sec, int verify_tls,
+                              int follow_redirects, int max_redirects, long timeout_ms, int verify_tls,
                               long max_body_size, int block_private_ips, void *share,
                               void *cancel_flag) {
-    CurlResponse resp = {0, NULL, 0, NULL, 0, NULL};
+    CurlResponse resp = {0, NULL, 0, NULL, 0, NULL, NULL};
 
     // 字段顺序：memory, size, capacity, limit, overflow。malloc(1) → 初始容量 1。
     struct MemoryStruct body_chunk = {malloc(1), 0, 1, 0, 0};
@@ -245,7 +246,9 @@ static CurlResponse do_on_handle(CURL *curl, const char *url, const char *proxy,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body_chunk);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &header_chunk);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_sec);
+    // 毫秒精度超时。用 CURLOPT_TIMEOUT（秒）时，任何亚秒超时都会被截断成 0，
+    // 而 0 在 libcurl 里表示「永不超时」——调用方要的 500ms 会变成无限等待。
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
     // 空串 = 启用 libcurl 编译进来的全部解压算法（含本库链接的 zstd）。
     // 这样即便我们在自定义 header 里把 Accept-Encoding 写成 "gzip, deflate, br, zstd"
     // （与真实 Chrome 一致），返回的 zstd / br 响应也能被正确解压，不会把压缩字节
@@ -299,6 +302,9 @@ static CurlResponse do_on_handle(CURL *curl, const char *url, const char *proxy,
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
     } else {
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        // 必须显式设上限：不设时 libcurl 用自己的默认值（当前为 30），调用方
+        // 设的 max_redirects 会被完全忽略，重定向环也要跑满 30 跳才停。
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, (long)(max_redirects > 0 ? max_redirects : 10));
     }
 
     if (proxy && strlen(proxy) > 0) {
@@ -326,11 +332,21 @@ static CurlResponse do_on_handle(CURL *curl, const char *url, const char *proxy,
     }
 
     // HTTP 方法
+    //
+    // POST 走 CURLOPT_POST 而不是 CUSTOMREQUEST：CUSTOMREQUEST 设的方法会被
+    // libcurl 原样带到**每一跳**重定向上，于是 POST → 302 → 下一跳仍是 POST 且
+    // 重发 body，与浏览器 / RFC 9110 的「301/302/303 降级为 GET」相悖。用
+    // CURLOPT_POST 时 libcurl 会按 CURLOPT_POSTREDIR（默认 0）自行降级。
+    int is_post = method && strcmp(method, "POST") == 0;
     if (method && strlen(method) > 0) {
         if (strcmp(method, "HEAD") == 0) {
             curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+        } else if (is_post) {
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
         } else if (strcmp(method, "GET") != 0) {
-            // POST/PUT/DELETE/PATCH/OPTIONS 等显式方法
+            // PUT/DELETE/PATCH/OPTIONS 等显式方法。注意这些仍会被带到重定向的
+            // 每一跳上（libcurl 对 CUSTOMREQUEST 的既定行为）；需要严格的降级
+            // 语义时请用 lclient 的 WithManualRedirects。
             curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
         }
     }
@@ -339,6 +355,11 @@ static CurlResponse do_on_handle(CURL *curl, const char *url, const char *proxy,
     if (post_size > 0 && post_data) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, post_size);
         curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, post_data);
+    } else if (is_post) {
+        // 无 body 的 POST：必须显式给出长度 0，否则 CURLOPT_POST 会让 libcurl
+        // 走读回调去 stdin 找 body。
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L);
+        curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, "");
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -355,6 +376,11 @@ static CurlResponse do_on_handle(CURL *curl, const char *url, const char *proxy,
         }
     } else {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status_code);
+        // 最终 URL（跟随完全部重定向后）。libcurl 持有的串在下次请求时会失效，
+        // 故 strdup 一份交给调用方，由 free_response 释放。
+        char *eff = NULL;
+        curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff);
+        if (eff) resp.effective_url = strdup(eff);
         resp.body = body_chunk.memory;
         resp.body_size = body_chunk.size;
         resp.headers = header_chunk.memory;
@@ -375,18 +401,18 @@ CurlResponse curl_do_request(const char *url, const char *proxy, const char *pro
                               const char *impersonate_target, const char *method,
                               const char **header_keys, const char **header_vals, int header_count,
                               const char *post_data, long post_size,
-                              int follow_redirects, int timeout_sec, int verify_tls,
+                              int follow_redirects, int max_redirects, long timeout_ms, int verify_tls,
                               long max_body_size, int block_private_ips, void *share,
                               void *cancel_flag) {
     CURL *curl = curl_easy_init();
     if (!curl) {
-        CurlResponse resp = {0, NULL, 0, NULL, 0, NULL};
+        CurlResponse resp = {0, NULL, 0, NULL, 0, NULL, NULL};
         resp.error = strdup("curl_easy_init failed");
         return resp;
     }
     CurlResponse resp = do_on_handle(curl, url, proxy, proxy_userpwd, impersonate_target, method,
                                      header_keys, header_vals, header_count, post_data, post_size,
-                                     follow_redirects, timeout_sec, verify_tls, max_body_size, block_private_ips, share,
+                                     follow_redirects, max_redirects, timeout_ms, verify_tls, max_body_size, block_private_ips, share,
                                      cancel_flag);
     curl_easy_cleanup(curl);
     return resp;
@@ -398,11 +424,11 @@ CurlResponse curl_do_request_reuse(CURL *curl, const char *url, const char *prox
                               const char *impersonate_target, const char *method,
                               const char **header_keys, const char **header_vals, int header_count,
                               const char *post_data, long post_size,
-                              int follow_redirects, int timeout_sec, int verify_tls,
+                              int follow_redirects, int max_redirects, long timeout_ms, int verify_tls,
                               long max_body_size, int block_private_ips, void *share,
                               void *cancel_flag) {
     if (!curl) {
-        CurlResponse resp = {0, NULL, 0, NULL, 0, NULL};
+        CurlResponse resp = {0, NULL, 0, NULL, 0, NULL, NULL};
         resp.error = strdup("nil curl handle");
         return resp;
     }
@@ -411,13 +437,14 @@ CurlResponse curl_do_request_reuse(CURL *curl, const char *url, const char *prox
     curl_easy_reset(curl);
     return do_on_handle(curl, url, proxy, proxy_userpwd, impersonate_target, method,
                         header_keys, header_vals, header_count, post_data, post_size,
-                        follow_redirects, timeout_sec, verify_tls, max_body_size, block_private_ips, share,
+                        follow_redirects, max_redirects, timeout_ms, verify_tls, max_body_size, block_private_ips, share,
                         cancel_flag);
 }
 
 void free_response(CurlResponse *resp) {
     if (resp->body) { free(resp->body); resp->body = NULL; }
     if (resp->headers) { free(resp->headers); resp->headers = NULL; }
+    if (resp->effective_url) { free(resp->effective_url); resp->effective_url = NULL; }
     if (resp->error) { free(resp->error); resp->error = NULL; }
 }
 */
@@ -426,6 +453,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -437,6 +465,8 @@ type Response struct {
 	StatusCode int
 	Body       []byte
 	Headers    string
+	// EffectiveURL 是跟随完全部重定向后的最终 URL；未发生重定向时即请求 URL。
+	EffectiveURL string
 }
 
 // Request 是一次请求的完整描述。HeaderKeys / HeaderVals 必须等长且一一对应，
@@ -450,7 +480,10 @@ type Request struct {
 	HeaderVals      []string
 	Body            []byte
 	FollowRedirects bool
-	TimeoutSec      int
+	// MaxRedirects 是 FollowRedirects 时的最大跳数上限；<=0 取默认值 10。
+	MaxRedirects int
+	// Timeout 是整次请求的超时，毫秒精度；<=0 表示不限制。
+	Timeout         time.Duration
 	VerifyTLS       bool   // true 时校验目标 TLS 证书
 	MaxBodyBytes    int64  // 响应体上限（字节），0 = 不限制
 	BlockPrivateIPs bool   // true 时拦截解析到私网/环回/链路本地的地址（SSRF 防护）
@@ -587,6 +620,11 @@ func marshalAndPerform(handle unsafe.Pointer, req Request) (*Response, error) {
 	if req.BlockPrivateIPs {
 		blockIPs = 1
 	}
+	// 毫秒超时：<=0 传 0，即 libcurl 的「不限制」。
+	timeoutMS := req.Timeout.Milliseconds()
+	if timeoutMS < 0 {
+		timeoutMS = 0
+	}
 	var sharePtr unsafe.Pointer
 	if req.Share != nil {
 		sharePtr = req.Share.p
@@ -620,13 +658,13 @@ func marshalAndPerform(handle unsafe.Pointer, req Request) (*Response, error) {
 		resp = C.curl_do_request(cURL, cProxy, cProxyAuth, cImpersonate, cMethod,
 			keysPtr, valsPtr, C.int(headerCount),
 			bodyPtr, C.long(len(req.Body)),
-			follow, C.int(req.TimeoutSec), verify,
+			follow, C.int(req.MaxRedirects), C.long(timeoutMS), verify,
 			C.long(req.MaxBodyBytes), blockIPs, sharePtr, cancelPtr)
 	} else {
 		resp = C.curl_do_request_reuse(handle, cURL, cProxy, cProxyAuth, cImpersonate, cMethod,
 			keysPtr, valsPtr, C.int(headerCount),
 			bodyPtr, C.long(len(req.Body)),
-			follow, C.int(req.TimeoutSec), verify,
+			follow, C.int(req.MaxRedirects), C.long(timeoutMS), verify,
 			C.long(req.MaxBodyBytes), blockIPs, sharePtr, cancelPtr)
 	}
 	defer C.free_response(&resp)
@@ -636,9 +674,10 @@ func marshalAndPerform(handle unsafe.Pointer, req Request) (*Response, error) {
 	}
 
 	return &Response{
-		StatusCode: int(resp.status_code),
-		Body:       C.GoBytes(unsafe.Pointer(resp.body), C.int(resp.body_size)),
-		Headers:    C.GoStringN(resp.headers, C.int(resp.headers_size)),
+		StatusCode:   int(resp.status_code),
+		Body:         C.GoBytes(unsafe.Pointer(resp.body), C.int(resp.body_size)),
+		Headers:      C.GoStringN(resp.headers, C.int(resp.headers_size)),
+		EffectiveURL: C.GoString(resp.effective_url),
 	}, nil
 }
 
@@ -660,7 +699,7 @@ func DoRequest(url, proxy, impersonate string, headers map[string]string, postDa
 		HeaderVals:      vals,
 		Body:            []byte(postData),
 		FollowRedirects: followRedirects,
-		TimeoutSec:      timeoutSec,
+		Timeout:         time.Duration(timeoutSec) * time.Second,
 		VerifyTLS:       false,
 	})
 }

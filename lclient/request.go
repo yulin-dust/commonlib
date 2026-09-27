@@ -114,7 +114,7 @@ type oInsecure struct{ b bool }
 type oMaxBody struct{ n int64 }
 
 func (o oTimeout) applyToRequest(r *PreparedRequest, _ sessionSnapshot) {
-	r.Timeout = int(o.d.Seconds())
+	r.Timeout = o.d
 }
 func (o oProxy) applyToRequest(r *PreparedRequest, _ sessionSnapshot)    { r.Proxy = o.s }
 func (o oProfile) applyToRequest(r *PreparedRequest, _ sessionSnapshot)  { r.Profile = o.s }
@@ -284,14 +284,12 @@ func (s *Session) Do(method, rawURL string, opts ...RequestOption) (*Response, e
 		Headers:         snap.defaultHeaders, // snapshot() 已返回独立副本，无需再 Clone
 		Profile:         snap.impersonate,
 		Proxy:           snap.proxy,
-		Timeout:         int(snap.timeout.Seconds()),
+		Timeout:         snap.timeout,
 		FollowRedirects: snap.followRedirects,
+		MaxRedirects:    snap.maxRedirects,
 		InsecureTLS:     snap.insecureTLS,
 		MaxBodyBytes:    snap.maxBodyBytes,
 		BlockPrivateIPs: snap.blockPrivateIPs,
-	}
-	if prep.Timeout <= 0 {
-		prep.Timeout = 30
 	}
 
 	if prep.Ctx == nil {
@@ -311,6 +309,12 @@ func (s *Session) Do(method, rawURL string, opts ...RequestOption) (*Response, e
 	// body 构造期错误（如 JSON 序列化失败）在此显式返回，不再静默发出畸形请求
 	if prep.bodyErr != nil {
 		return nil, &RequestError{Op: prep.Method + " " + prep.URL, Err: prep.bodyErr}
+	}
+
+	// 2.5 超时兜底：放在请求级 options 之后，避免 Timeout(...) 把它覆盖回 0
+	//     （0 传到 libcurl 是"永不超时"，不是"立刻超时"）。
+	if prep.Timeout <= 0 {
+		prep.Timeout = 30 * time.Second
 	}
 
 	// 3. 自动 UA
@@ -418,8 +422,10 @@ func (s *Session) executeWithRetry(prep *PreparedRequest) (*Response, error) {
 		}
 
 		lastErr = err
-		// 取消错误不重试
-		if errors.Is(err, ErrCanceled) {
+		// 确定性失败重试也不会变，直接原样返回——顺带保住调用方对哨兵错误的
+		// errors.Is 判定（走到下面的 ErrTooManyRetries 包装时链路里仍有它们，
+		// 但语义上这类错误本就不该被重试 3 次）。
+		if isFatalError(err) {
 			return nil, err
 		}
 		if attempt < maxAttempts && policy != nil {
@@ -433,10 +439,21 @@ func (s *Session) executeWithRetry(prep *PreparedRequest) (*Response, error) {
 		return nil, lastErr
 	}
 
+	// 用 %w 同时包住 ErrTooManyRetries 与底层错误：若用 %v，errors.Is(err,
+	// ErrTimeout) / ErrNetwork 等在开启重试后会全部失效。
 	return nil, &RequestError{
 		Op:  prep.Method + " " + prep.URL,
-		Err: fmt.Errorf("%w: %v", ErrTooManyRetries, lastErr),
+		Err: fmt.Errorf("%w: %w", ErrTooManyRetries, lastErr),
 	}
+}
+
+// isFatalError 报告该错误是否确定性失败——重试同样的请求只会得到同样的结果，
+// 白白放大目标站压力。取消 / 响应体超限 / SSRF 拦截 / 非法请求头都属此类。
+func isFatalError(err error) bool {
+	return errors.Is(err, ErrCanceled) ||
+		errors.Is(err, ErrBodyTooLarge) ||
+		errors.Is(err, ErrBlockedAddress) ||
+		errors.Is(err, ErrInvalidHeader)
 }
 
 // executeOnce 执行单次请求。
@@ -445,8 +462,8 @@ func (s *Session) executeOnce(prep *PreparedRequest) (*Response, error) {
 	// 用 ctx deadline 调整 timeout
 	timeout := prep.Timeout
 	if dl, ok := prep.Ctx.Deadline(); ok {
-		remain := int(time.Until(dl).Seconds())
-		if remain < 1 {
+		remain := time.Until(dl)
+		if remain <= 0 {
 			return nil, &RequestError{
 				Op:  prep.Method + " " + prep.URL,
 				Err: fmt.Errorf("%w: context deadline exceeded", ErrCanceled),
@@ -479,7 +496,8 @@ func (s *Session) executeOnce(prep *PreparedRequest) (*Response, error) {
 		HeaderVals:      headerVals,
 		Body:            prep.Body,
 		FollowRedirects: prep.FollowRedirects,
-		TimeoutSec:      timeout,
+		MaxRedirects:    prep.MaxRedirects,
+		Timeout:         timeout,
 		VerifyTLS:       !prep.InsecureTLS,
 		MaxBodyBytes:    prep.MaxBodyBytes,
 		BlockPrivateIPs: blockPrivateIPs,
@@ -621,6 +639,9 @@ func (s *Session) executeWithManualRedirects(prep *PreparedRequest) (*Response, 
 		if err != nil {
 			return lastResp, err
 		}
+		// 与 curl 自动跟随模式保持一致：URL 始终是最初发起的地址，
+		// FinalURL 才是跟完之后的落点。
+		resp.URL = prep.URL
 		lastResp = resp
 
 		// 写入 cookie jar

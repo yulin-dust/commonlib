@@ -7,6 +7,17 @@
 | [`lclient`](./lclient) | 带**完整浏览器 TLS/HTTP2 指纹模拟**的 HTTP 客户端（Python `requests` 风格），内置身份轮换、连接池、共享 DNS/TLS 缓存、SSRF 防护、响应体闸、可中断 context、自动字符集解码等 | ✅ 需要原生库 |
 | [`webextract`](./webextract) | 纯 Go 的网页正文 + 元数据提取（对标 trafilatura/readability），输出纯文本 / Markdown / 仅含文本的 HTML，字段对齐 go-trafilatura，针对中文优化 | ❌ 纯 Go |
 
+> 用到这两个包的成品工具放在独立仓库 [`seotools`](https://github.com/yulin-dust/seotools)
+> （例如 `linkaudit`：批量分析外链来源页）。本仓库只保留可复用的库，不放业务命令。
+
+## 选型提示
+
+- `lclient` 只在**目标站有 JA3 / JA4 级别风控**时才值得用——它是 cgo，要装原生库、不能
+  交叉编译、`CGO_ENABLED=0` 编不过。普通内部调用请继续用 `net/http`。它也**不执行
+  JavaScript**，搞不定 Cloudflare 那类需要跑 JS 挑战的页面。
+  详见 [lclient 的优点 / 缺点](./lclient/README.md#优点--缺点)。
+- `webextract` 是纯 Go，没有任何额外依赖，可以放心单独用。
+
 ## 安装
 
 ```bash

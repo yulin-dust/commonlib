@@ -22,7 +22,7 @@ func req(url string) Request {
 		URL:         url,
 		Impersonate: "chrome131",
 		Method:      "GET",
-		TimeoutSec:  10,
+		Timeout:     10 * time.Second,
 		VerifyTLS:   false,
 	}
 }
@@ -249,7 +249,7 @@ func TestContextCancel(t *testing.T) {
 	go func() { time.Sleep(150 * time.Millisecond); cancel() }()
 
 	r := req(srv.URL)
-	r.TimeoutSec = 30
+	r.Timeout = 30 * time.Second
 	r.Ctx = ctx
 	start := time.Now()
 	_, err := Do(r)

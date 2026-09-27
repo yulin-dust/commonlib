@@ -18,23 +18,34 @@ type Response struct {
 	Status     string // "200 OK"
 	Header     map[string][]string
 	Body       []byte
-	URL        string        // 请求的 URL（可能不是最终重定向后的）
-	Elapsed    time.Duration // 耗时
+	URL        string // 发起请求时的 URL（不含重定向）
+	// FinalURL 是跟随完全部重定向后的最终 URL；未发生重定向时与 URL 相同。
+	// 解析页面里的相对链接必须用它，用 URL 会把相对路径接到跳转前的地址上。
+	FinalURL string
+	Elapsed  time.Duration // 耗时
 }
 
 // OK 是否 2xx。
 func (r *Response) OK() bool { return r.StatusCode >= 200 && r.StatusCode < 300 }
 
-// Text 以字符串返回 body（原始字节，不做字符集转换）。
-// 目标页是 GB2312/GBK/Big5 等非 UTF-8 编码时，这里会乱码——改用 DecodedText()。
+// Text 以字符串返回 body。
+//
+// Session 默认开启 WithAutoDecode，Body 进来时已按页面字符集转成 UTF-8，
+// 因此直接用 Text() 即可，GB2312/GBK/Big5 等页面不会乱码。只有显式
+// WithAutoDecode(false) 关掉之后，Body 才是服务器原始字节——那种情况下要
+// 转码请用 DecodedText()。
 func (r *Response) Text() string { return string(r.Body) }
 
-// Bytes 返回 body 字节（原始）。
+// Bytes 返回 body 字节。与 Text() 同理：默认已是 UTF-8，
+// 关闭 WithAutoDecode 后才是服务器原始字节。
 func (r *Response) Bytes() []byte { return r.Body }
 
 // DecodedBody 按页面声明的字符集把 body 转成 UTF-8 字节：依次看 Content-Type 头的
 // charset、HTML <meta charset>、以及 BOM 嗅探。已是 UTF-8 或检测/转换失败时原样返回。
 // 用于 GB2312/GBK/Big5/Shift-JIS 等非 UTF-8 页面，避免乱码。
+//
+// 仅在关闭了 WithAutoDecode 时才需要它——默认开启的情况下 Body 已经是 UTF-8，
+// 再调一次是多余的（对已转好的内容通常无害，但没有意义）。
 //
 // 注意：若打算把 body 交给会自行检测字符集的解析器（如 webextract），请直接传原始
 // Body，不要先 Decode——否则会按已过期的 <meta charset> 二次解码而损坏内容。
@@ -110,11 +121,16 @@ func (r *Response) Cookies() []*http.Cookie {
 
 // buildResponse 把底层 curl 返回的 Response 转成我们的对象。
 func buildResponse(raw *curl.Response, reqURL string, elapsed time.Duration) *Response {
+	finalURL := raw.EffectiveURL
+	if finalURL == "" {
+		finalURL = reqURL
+	}
 	r := &Response{
 		StatusCode: raw.StatusCode,
 		Body:       raw.Body,
 		Header:     parseRawHeaders(raw.Headers),
 		URL:        reqURL,
+		FinalURL:   finalURL,
 		Elapsed:    elapsed,
 	}
 	// 拼一个 status 文本
@@ -133,11 +149,20 @@ func buildResponse(raw *curl.Response, reqURL string, elapsed time.Duration) *Re
 //	content-type: text/html
 //	set-cookie: a=1; Path=/
 //	set-cookie: b=2; Path=/
+//
+// 注意 raw 里可能有**多段** header：curl 自动跟随重定向时每一跳各来一段，
+// 1xx 中间响应、经代理时的 "HTTP/1.1 200 Connection established" 同理。只有
+// 最后一段属于最终响应，因此每遇到一个状态行就重置累积结果——否则
+// HeaderGet("Content-Type") 取到的会是第一跳（常是 302 页面）的值，进而让
+// autoDecode 用错字符集去解码最终 body。
+//
+// Set-Cookie 是唯一的例外：每一跳下发的 cookie 都要进 jar，故跨段累积。
 func parseRawHeaders(raw string) map[string][]string {
 	out := make(map[string][]string)
 	if raw == "" {
 		return out
 	}
+	var setCookies []string // 跨所有段累积
 	scanner := bufio.NewScanner(strings.NewReader(raw))
 	// 初始 4KB（足够绝大多数 header 行），上限 1MB（容纳超大 Cookie 等）。
 	// 初始值放小，避免每个响应都固定预分配 64KB。
@@ -148,7 +173,8 @@ func parseRawHeaders(raw string) map[string][]string {
 			continue
 		}
 		if strings.HasPrefix(line, "HTTP/") {
-			// 状态行：HTTP/2 200 或 HTTP/1.1 200 OK
+			// 状态行：HTTP/2 200 或 HTTP/1.1 200 OK。新的一段开始，丢掉上一段。
+			out = make(map[string][]string)
 			parts := strings.SplitN(line, " ", 3)
 			if len(parts) >= 2 {
 				out["Status"] = []string{strings.TrimSpace(strings.Join(parts[1:], " "))}
@@ -163,7 +189,14 @@ func parseRawHeaders(raw string) map[string][]string {
 		v := strings.TrimSpace(line[idx+1:])
 		// 规范化 key（首字母大写）以兼容 http.Header 习惯
 		k = http.CanonicalHeaderKey(k)
+		if k == "Set-Cookie" {
+			setCookies = append(setCookies, v)
+			continue
+		}
 		out[k] = append(out[k], v)
+	}
+	if len(setCookies) > 0 {
+		out["Set-Cookie"] = setCookies
 	}
 	return out
 }

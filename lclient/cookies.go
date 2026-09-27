@@ -28,6 +28,12 @@ func NewCookieJar() *CookieJar {
 // 安全：服务器通过 Set-Cookie 的 Domain 属性声明的作用域，必须覆盖当前请求
 // 的 host（即 host 等于该 domain 或是其子域），且不能是公共后缀（如 "com"）。
 // 否则丢弃，防止 evil.com 给 bank.com / 顶级域写 cookie 的跨域注入。
+//
+// host-only 语义：没带 Domain 属性的 cookie 只属于下发它的那个 host，不该发给
+// 子域（RFC 6265 §5.3）。存储上沿用 Netscape / curl cookie jar 的老约定——带
+// Domain 的存成 ".example.com"（前导点 = 含子域），host-only 的存成
+// "example.com"（无点）——这样导出的 []*http.Cookie 仍是标准类型，JSON 持久化
+// 也能原样往返。
 func (j *CookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 	if u == nil {
 		return
@@ -44,6 +50,7 @@ func (j *CookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 
 		// 计算并校验作用域 domain
 		domain := host
+		hostOnly := true
 		if c2.Domain != "" {
 			cd := canonicalHost(strings.TrimPrefix(c2.Domain, "."))
 			if cd != host {
@@ -54,8 +61,14 @@ func (j *CookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
 				}
 			}
 			domain = cd
+			hostOnly = false // 显式 Domain → 含子域
 		}
-		c2.Domain = domain
+		// 桶 key 始终是不带点的规范 domain；点只写进 c2.Domain 作为标记。
+		if hostOnly {
+			c2.Domain = domain
+		} else {
+			c2.Domain = "." + domain
+		}
 
 		j.upsertLocked(domain, &c2)
 	}
@@ -88,13 +101,19 @@ func (j *CookieJar) Cookies(u *url.URL) []*http.Cookie {
 
 	// 只查 host 自身及其各级父域对应的桶，避免遍历整个 jar。
 	for _, domain := range hostDomainKeys(host) {
+		// 父域桶里只有"带 Domain 属性"的 cookie 才该发过来；
+		// 该父域自己下发的 host-only cookie 不属于当前子域。
+		parentBucket := domain != host
 		for _, c := range j.cookies[domain] {
 			// 过期判断
 			if !c.Expires.IsZero() && c.Expires.Before(now) {
 				continue
 			}
-			// 路径判断（简化版）
-			if c.Path != "" && !strings.HasPrefix(u.Path, c.Path) && !(c.Path == "/" || u.Path == "") {
+			if parentBucket && !strings.HasPrefix(c.Domain, ".") {
+				continue // host-only，不外溢到子域
+			}
+			// 路径判断（RFC 6265 §5.1.4）
+			if !pathMatch(u.Path, c.Path) {
 				continue
 			}
 			// Secure 判断
@@ -105,6 +124,26 @@ func (j *CookieJar) Cookies(u *url.URL) []*http.Cookie {
 		}
 	}
 	return out
+}
+
+// pathMatch 实现 RFC 6265 §5.1.4 的 path-match：要么完全相等，要么 cookiePath
+// 是 reqPath 的前缀且边界落在 "/" 上。纯 strings.HasPrefix 会让 Path=/ab 的
+// cookie 错误地发给 /abc 这种无关路径。
+func pathMatch(reqPath, cookiePath string) bool {
+	if cookiePath == "" || cookiePath == "/" {
+		return true
+	}
+	if reqPath == "" {
+		reqPath = "/"
+	}
+	if reqPath == cookiePath {
+		return true
+	}
+	if !strings.HasPrefix(reqPath, cookiePath) {
+		return false
+	}
+	// /foo 匹配 /foo/bar；/foo/ 也匹配 /foo/bar
+	return strings.HasSuffix(cookiePath, "/") || reqPath[len(cookiePath)] == '/'
 }
 
 // hostDomainKeys 返回 host 自身及其逐级父域，用于在按 domain 分桶的 jar 中
@@ -148,14 +187,14 @@ func (j *CookieJar) Clear() {
 func (j *CookieJar) ClearDomain(domain string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	delete(j.cookies, canonicalHost(domain))
+	delete(j.cookies, canonicalHost(strings.TrimPrefix(domain, ".")))
 }
 
 // ExportByDomain 导出某 domain 的全部 cookies（用于持久化）。
 func (j *CookieJar) ExportByDomain(domain string) []*http.Cookie {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
-	src := j.cookies[canonicalHost(domain)]
+	src := j.cookies[canonicalHost(strings.TrimPrefix(domain, "."))]
 	out := make([]*http.Cookie, len(src))
 	for i, c := range src {
 		cc := *c
@@ -220,10 +259,18 @@ func (j *CookieJar) LoadFromFile(path string) error {
 	return nil
 }
 
-// canonicalHost 把 host 标准化（去端口、转小写）。
+// canonicalHost 把 host 标准化（去端口、转小写、剥掉 IPv6 字面量的方括号）。
+// 直接按第一个 ":" 截断会把 "[::1]:8080" 切成 "["，故 IPv6 要单独处理。
 func canonicalHost(h string) string {
-	h = strings.ToLower(h)
-	if i := strings.Index(h, ":"); i >= 0 {
+	h = strings.ToLower(strings.TrimSpace(h))
+	if strings.HasPrefix(h, "[") {
+		if i := strings.Index(h, "]"); i >= 0 {
+			return h[1:i] // "[::1]:8080" → "::1"
+		}
+		return h
+	}
+	// 仅在恰好有一个 ":" 时视为 host:port；多个 ":" 说明是没加括号的裸 IPv6。
+	if i := strings.Index(h, ":"); i >= 0 && strings.Count(h, ":") == 1 {
 		h = h[:i]
 	}
 	return h
