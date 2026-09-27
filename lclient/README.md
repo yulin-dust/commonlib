@@ -86,10 +86,10 @@ Firefox / Safari 的 TLS 扩展顺序、密码套件、椭圆曲线、ALPS、HTT
 - macOS：[`README-mac 安装.md`](./README-mac%20安装.md)
 - Linux：[`README-linux 安装.md`](./README-linux%20安装.md)
 
-> **依赖说明（重要）**：lclient 依赖的 `go-curl-impersonate` 是一个**本地 fork**，在
-> `commonlib/go.mod` 里通过 `replace` 指向 `./third_party/curlimpersonate`。因此把 lclient
-> 作为外部依赖 `go get` 时，使用方的 `go.mod` 也要带上同样的 `require` + `replace`，把 fork
-> 一并提供。直接在 `commonlib` 仓库内使用则无需任何额外配置。
+> **依赖说明**：lclient 依赖的 `go-curl-impersonate` 是一个 fork，已经作为普通包放在
+> 本 module 内（`commonlib/third_party/curlimpersonate`），**不需要任何 `replace`**。
+> `go get github.com/yulin-dust/commonlib` 之后直接 import `lclient` 即可，Go 会把
+> 那个包一并拉下来。要装的只有原生库 `libcurl-impersonate`。
 
 ---
 
